@@ -4,33 +4,70 @@
 
 The solution aggregates the 3.1 million request records in `/data/requests.log` and writes the byte-stable result to `/out/summary.txt`.
 
-### Input and parsing
+### Memory-oriented design
 
-- The input is mapped read-only with `mmap` on Linux (with a guarded Windows implementation for local development). Endpoint names are represented as `std::string_view` slices into that stable mapping, avoiding a separate allocation and copy for every endpoint occurrence.
-- For large inputs, the file is divided into at most 12 approximate byte ranges. Each range is aligned to complete LF-terminated records before a worker parses it. Small inputs below 2 MiB use one worker.
-- The parser reads the fixed-width 27-byte UTC timestamp directly. The specification guarantees the same 72-hour date span for every seed, so the timestamp is mapped to an hour index from 0 through 71 without a general-purpose date parser.
-- Method is ignored as specified. A status beginning with `5` represents a 500–599 response; latency is parsed as an unsigned 32-bit integer.
+The implementation deliberately uses two sequential passes instead of retaining separate latency vectors in every worker and hour/endpoint group.
 
-The workers aggregate independently. Each worker assigns compact local endpoint IDs and stores counts, 5xx counts and latency values by hour and endpoint. This avoids shared mutable aggregation state while parsing.
+**Pass 1 — group counts and errors**
 
-### Reduction and output
+- Read the input in fixed 64 KiB blocks. Each block is scanned for complete LF-terminated records; a small carry area preserves a record split across two reads.
+- Parse the fixed-width UTC timestamp and exact endpoint.
+- Assign each endpoint a compact 16-bit ID. The published catalogue contains exactly 1,842 endpoints.
+- Update one fixed table indexed by `hour * 1842 + endpoint_id`. Each group occupies 12 bytes: request count, 5xx count and a cursor.
+- A status beginning with `5` counts as an error; 499 does not.
 
-After parsing, the solution builds a global endpoint catalogue and maps each worker's local IDs to global IDs. It merges counts and error counts, combines the latency values for each non-empty (hour, endpoint) group, and selects the nearest-rank p50, p95 and p99 values.
+**Prefix allocation**
 
-For groups with more than 24 values, `std::nth_element` selects the three required ranks without fully sorting the group. Smaller groups are sorted directly. The rank calculation uses integer arithmetic: `(p * n + 99) / 100 - 1` for zero-based indexing.
+- Prefix-sum group counts in chronological-hour / endpoint-ID order.
+- The resulting cursor for each group identifies the start of its slice in one flat latency array.
+- Allocate exactly one `uint32_t` per input record: 12.4 MB for 3.1 million records. There is no per-group vector capacity slack or allocator metadata for millions of individual latency-vector allocations.
 
-The output is assembled in chronological hour order, with endpoints ordered lexicographically. It writes the eight required fields, integer parts-per-million error rates, LF line endings and a trailing newline for every record.
+**Pass 2 — latency placement**
+
+- Read the input again using the same bounded block reader.
+- Look up the already assigned endpoint ID and append the latency at that group's cursor.
+- Each group therefore ends up with one contiguous latency slice, without storing a group ID alongside every latency.
+
+### Percentiles and output
+
+- Groups with at most 24 values are sorted directly.
+- Larger groups use exact nearest-rank selection with `std::nth_element` for p95, p50 and p99. No approximation or histogram bucketing is used.
+- The rank calculation uses integer arithmetic: `(p * n + 99) / 100 - 1` for zero-based indexing.
+- Output is streamed one line at a time; the complete 10 MB result is not assembled in RAM.
+- Hours are emitted chronologically and endpoint names are sorted bytewise. All endpoints are ASCII under the specification, so ordinary string-view ordering matches the required bytewise order.
+- Error rate is `floor(errors * 1,000,000 / count)`, computed using integer arithmetic.
+
+### Memory trade-off
+
+The previous implementation allocated 72 × 2,048 `LocalGroup` objects per worker. With 12 workers and a 32-byte `LocalGroup`, that represented about 56.6 MB of largely empty group/vector objects before accounting for the actual latency data.
+
+The new implementation removes:
+- all duplicated worker-local hour/endpoint tables;
+- all per-group latency vectors and their capacity slack;
+- the full in-memory output string;
+- full-file memory mapping.
+
+It adds one sequential reread of the input. This is an intentional time-for-memory trade-off. The goal is to keep peak resident memory close to the unavoidable 12.4 MB latency payload plus compact group metadata and runtime overhead.
 
 ## Correctness assumptions from the specification
 
-The fast parser relies on the published input contract: ASCII, well-formed space-delimited records, fixed-width UTC timestamps, one LF at the end of every line, status values from 100 through 599, uint32 latencies, and the fixed 72-hour time span. It does not rely on global timestamp ordering: records are grouped by their parsed hour, so interleaved shards and out-of-order hour transitions are handled. Duplicate lines are processed independently and therefore count as separate requests.
+The fast parser relies on the published input contract: ASCII, well-formed space-delimited records, fixed-width 27-byte UTC timestamps, one LF at the end of every line, status values from 100 through 599, uint32 latencies, and the fixed 72-hour time span. It does not rely on global timestamp ordering: records are grouped by their parsed hour, so interleaved shards and out-of-order hour transitions are handled. Duplicate lines are processed independently and therefore count as separate requests.
 
-The implementation uses 16-bit endpoint IDs. This is sufficient for the specification's catalogue of 1,842 distinct endpoints, but it is an intentional bound tied to that published contract.
+The group table is sized for the specified catalogue of exactly 1,842 distinct endpoint templates. This is a task constraint, not a heuristic based on seed 1.
 
-## Dependencies
+## Dependencies and build
 
-No third-party runtime dependencies. The implementation uses C++20 standard-library facilities and operating-system file-mapping/resource APIs. The Dockerfile builds with the allowlisted, digest-pinned GCC 15 image and runs on the digest-pinned Debian 13 slim image.
+No third-party runtime dependencies. The implementation uses C++20 standard-library facilities and POSIX file I/O. The Dockerfile builds with the allowlisted, digest-pinned GCC 15 image and runs on the digest-pinned Debian 13 slim image.
 
-## With another 24 hours
+## Local validation status
 
-The next worthwhile work would be to profile allocation and peak-memory costs on the scoring machine, then test any alternative aggregation layout against the exact output hash across multiple generator seeds. A change would only be kept if it improved measured performance without changing output or exceeding the sandbox limits. The current approach favours a verified parallel parser and exact percentile selection over speculative SIMD or approximate statistics.
+The memory-optimized source was compiled with the same key flags as the Dockerfile (`-O3 -std=c++20 -static-libstdc++ -static-libgcc`) and also built with AddressSanitizer and UndefinedBehaviorSanitizer for edge-case testing.
+
+Recorded local checks:
+- Handcrafted edge-case input, including hour/month boundaries, duplicate lines, 5xx vs 499, zero and maximum uint32 latencies, and percentile group sizes 20, 100 and 101: byte-identical to an independent Python oracle.
+- Randomized 310,000-record dataset with 1,210 endpoints: byte-identical to an independent Python oracle.
+- 3,100,000-record synthetic full-scale dataset with all 1,842 endpoints: byte-identical to an independent Python oracle.
+- Empty input: empty `summary.txt`.
+- AddressSanitizer / UndefinedBehaviorSanitizer edge run: passed.
+
+These are local results. The 3.1-million-record dataset was synthetic, not the official seed-1 generator output. The official seed-1 SHA-256 and hidden holdout have not been revalidated in this branch, and the official board has not yet measured this candidate.
