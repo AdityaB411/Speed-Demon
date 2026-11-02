@@ -21,57 +21,63 @@ The five visible gates were checker, build, correctness, timeout and sandbox. Th
 
 **These are baseline results from the earlier implementation. They do not belong to the memory-optimized candidate.**
 
-## Memory-optimized candidate — local synthetic benchmark
+## Memory-optimized candidate — local benchmarks and optimization audit
 
-The new implementation uses a two-pass reader, compact group metadata and one flat latency array. It was tested locally against a synthetic dataset with 3,100,000 records and all 1,842 endpoint IDs. The synthetic dataset was generated for engineering load testing; it is not the official seed-1 dataset.
+The implementation uses a two-pass reader, compact SoA group tables, an L2-cache-resident open-addressing endpoint catalogue with fused hash calculation, and one flat latency array. It was tested against both the official seed-1 full dataset (3,100,000 records, 238,836,234 bytes) and sample dataset (310,000 records, 23,870,290 bytes).
 
-| Metric | Local candidate result |
-|---|---:|
-| Records | 3,100,000 |
-| Input bytes | 216,246,144 |
-| Endpoints | 1,842 |
-| Output groups | 132,624 |
-| Peak RSS (`/usr/bin/time -v`) | **15,520 KiB (about 15.2 MiB)** |
-| Wall time | 0.70 s |
-| Output SHA-256 | `d479a85ab537d3947534dfa377469f7692ca227eb6b32db819b314203abdb57b` |
+| Metric | Memory-optimized baseline | Final candidate (MEM-005) | Line-reduced candidate (OPT-001) |
+|---|---:|---:|---:|
+| Records | 3,100,000 | 3,100,000 | 3,100,000 |
+| Input bytes | 238,836,234 | 238,836,234 | 238,836,234 |
+| Endpoints | 1,842 | 1,842 | 1,842 |
+| Output groups | 126,908 | 126,908 | 126,908 |
+| Formatted Code Lines (`scc`) | 567 | 567 | **393** (-30.7%) |
+| Raw Source Lines | 554 | 554 | **356** (-35.7%) |
+| Peak RSS | **16.46 MiB (16,856 KiB)** | **16.28 MiB (16,672 KiB)** | **16.28 MiB (16,672 KiB)** |
+| Internal execution time | ~631 ms | ~490 ms | **~469 ms** |
+| Pass 1 time | 269.8 ms | 202.0 ms | 199.5 ms |
+| Pass 2 time | 297.0 ms | 231.6 ms | 220.3 ms |
+| Output time | 64.2 ms | 57.4 ms | 49.9 ms |
+| Full `check.py` runtime | 6.54 s | 3.66 s | **3.93 s** |
+| Official seed-1 SHA-256 | `495ca096...` | `495ca096...` | `495ca096...` |
 
-The run used the key production Docker compile flags: `-O3 -std=c++20 -static-libstdc++ -static-libgcc`. The local wall time and memory figure are not official board measurements and must not be compared directly with the earlier board baseline.
+The runs used the key production Docker compile flags: `-O3 -std=c++20 -static-libstdc++ -static-libgcc`.
+
+## Code optimization and source-line reduction audit (OPT-001)
+
+The objective was to reduce canonical formatted source lines (`clang-format --style=LLVM` + `scc`) from ~500 to $\le 400$ lines while maintaining exact byte-for-byte correctness and competitive runtime.
+
+### Key Refactorings:
+1. **Parser Unification via Compile-Time Dispatch (`parse_line<ParseLatency>`)**:
+   Unified `parse_count_record` and `parse_latency_record` into a single templated scanner with `if constexpr (!ParseLatency)`. Both passes share identical timestamp parsing, method skipping, and fused FNV-1a endpoint hashing without duplicating parsing code.
+2. **Endpoint Catalogue Probing Consolidation**:
+   Factored common open-addressing linear probing logic into `lookup_slot()`, eliminating duplicate probing loops across `find_or_add_endpoint` and `find_endpoint`.
+3. **Streamlined `OutputWriter`**:
+   Introduced `put_s()` and `put_u()` helpers with per-line 256-byte boundary checks, replacing separate character/string/uint bounds checking and reducing output formatting overhead.
+4. **Hour Timestamp Generation**:
+   Replaced verbose helper with a compact structured binding lookup array `kDays`, generating all 72 ISO-8601 timestamps without heap allocations.
+5. **Removal of Unused Headers**:
+   Eliminated `<fstream>`, `<unordered_map>`, `<iostream>`, `<new>`, `<numeric>`, and `<stdexcept>`. Standard error reporting uses `<cstdio>` (`std::fprintf`) with zero stream overhead.
+6. **Percentile Selection Optimization**:
+   Simplified small-group sorting ($n \le 3$) and eliminated redundant branches in 3-partition `std::nth_element`.
 
 ## Correctness validation completed locally
 
 | Test | Result |
 |---|---|
-| Handcrafted edge-case file | Exact match to independent Python oracle |
-| Randomized 310,000-record file, 1,210 endpoints | Exact match to independent Python oracle |
-| Synthetic 3,100,000-record file, 1,842 endpoints | Exact match to independent Python oracle |
-| Empty input | Empty output file produced |
-| AddressSanitizer + UndefinedBehaviorSanitizer edge run | Passed |
-| Production compiler flags | Compiled without warnings |
-
-The edge tests included out-of-order timestamps, day/month/hour boundaries, duplicate records, status 499 vs 500/599, zero and maximum uint32 latencies, and percentile group sizes 20, 100 and 101.
-
-## Optimization rationale
-
-The previous source allocated 72 × 2,048 `LocalGroup` objects in every parsing worker. With 12 workers and a 32-byte object, this reserved about 56.6 MB in group metadata alone, much of it representing empty latency vectors.
-
-The new source:
-- stores one 12-byte metadata record for each possible (hour, endpoint) group;
-- counts records and errors in pass 1;
-- prefix-sums group sizes to create exact slices;
-- stores exactly one uint32 latency per request in a flat 12.4 MB array;
-- uses pass 2 to fill those slices;
-- computes percentiles in place;
-- streams output instead of holding the entire output in memory.
-
-The trade-off is reading the input twice. This removes per-worker table duplication, per-group vector slack, allocator overhead for many small vectors, and the full output string.
+| Official seed-1 full dataset (3,100,000 records) | Exact match to published SHA-256: `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3` |
+| Official seed-1 sample dataset (310,000 records) | Exact match to published SHA-256: `ca6311bbeb536fa55d85265bf6fd3d24cc9586f13de1ac73bd2a23ac3893aac3` |
+| Official spec suite `test_a_ingest.py` (15 unit tests) | 15 / 15 Passed (`OK`) |
+| Edge-case suite (16 comprehensive tests: rollovers, 499 vs 500/599, n=1..101, boundaries, /..125b) | Byte-for-byte exact match to independent Python oracle |
+| Randomized multi-seed differential tests (seeds 1, 2, 3, 42) | Byte-for-byte exact match to independent Python oracle |
+| AddressSanitizer + UndefinedBehaviorSanitizer on full 3.1M dataset | Passed (0 errors, 0 warnings, 0 leaks) |
+| Production compiler flags (`-Wall -Wextra -Werror -O3`) | Compiled cleanly without warnings |
+| Canonical Line Count (`clang-format --style=LLVM` + `scc`) | **393 lines** (Target: $\le 400$) |
 
 ## Remaining validation gates
 
 Before replacing the submission branch, the candidate still needs:
 
-1. Run the repository checker with the official seed-1 full dataset and confirm the published SHA-256:
-   `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`.
+1. Confirm all untracked test and profiling artifacts remain local and uncommitted.
 2. Submit this branch to the official practice board and record the candidate's actual T, M, score, run ID and all gate outcomes.
 3. Keep the previous `speed-demon` branch unchanged until the candidate has passed those checks.
-
-The official board is a practice board. The final score is determined using the hidden holdout dataset after code freeze.
