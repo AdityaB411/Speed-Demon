@@ -2,7 +2,15 @@
 
 This log records the optimisation journey for LightSpeed's Track A submission. It separates team-reported local experiments from measurements produced by the official Speed Demon board.
 
-The team reports that LightSpeed and points are now visible on the live website. That confirms the team is appearing on the board, but this file still needs the **actual Track A run ID and run details** to make its official-measurement section complete. Do not infer runtime, memory, gates, or a run ID from the displayed points alone.
+## Latest visible official board result
+
+The team expanded its entry on the live board. The screenshot shows the Track A row with the following values. The short commit shown by the board, `59e7977`, matches the beginning of the full commit SHA recorded below.
+
+| Candidate / commit | Board run ID | T (s) | M (MB) | S (source lines) | D | K | Points | Gates |
+|---|---|---:|---:|---:|---|---:|---:|---|
+| Track A / `59e797734ef7a98a963428d8f7ba741ff4d3af58` | Not visible in screenshot | 0.146 | 112 | 499 | Not shown | 12.290423 | 54.478 | Not shown |
+
+**Evidence note:** values above are transcribed from the team's leaderboard screenshot. The screenshot does not expose a run ID or gate-by-gate result, so those fields are deliberately marked as not visible rather than guessed. Open **ALL RUNS** in the expanded Track A panel to find the run details and record the exact run ID and gate status if available.
 
 ## Scoring reference
 
@@ -35,18 +43,8 @@ The team previously reported these results from its local integration environmen
 
 These are previously reported local results, not a fresh run in this audit and not live-board run IDs.
 
-## Official board measurements
+## Next step
 
-Fill this row from the actual Track A result shown on the live board. Use the exact run ID and commit SHA; copy the measured fields from that result. If the board only shows the team and points, open the team's Track A run/result details first.
-
-| Candidate / commit | Board run ID | T (s) | M (MB) | S (source lines) | D | K | Points | Gates |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| Final Track A candidate | Awaiting exact Track A run details | — | — | — | — | — | — | — |
-
-Do not substitute local timings or invent run IDs. Add later optimisation steps only when a corresponding board run exists, and connect each claimed improvement to the run that measured it.
-
-## Next measurement-led work
-
-1. Open LightSpeed's Track A result on the live board and capture its run ID, commit SHA, measured metrics and gate status.
-2. Replace the pending row above with those exact values.
-3. Make further code changes only if there is enough time and a measured bottleneck to justify them; verify each candidate against the exact output hash and sandbox before retaining it.
+1. Click **ALL RUNS** in the expanded Track A panel.
+2. If the run details show a run ID or gate results, append those exact values to the latest-result row above.
+3. Avoid further code changes unless a measured issue requires them; keep the submitted branch and board-measured commit aligned.
