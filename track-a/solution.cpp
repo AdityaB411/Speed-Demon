@@ -1,516 +1,445 @@
-#include <iostream>
-#include <fstream>
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
-#include <vector>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <algorithm>
-#include <numeric>
-#include <cstdint>
-#include <cstring>
-#include <chrono>
-#include <thread>
-#include <future>
+#include <vector>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <psapi.h>
-#else
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/resource.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
-#endif
 
-// Memory-mapped file reader for fast zero-copy parsing on Windows and Linux
-struct MappedFile {
-    const char* data = nullptr;
-    size_t size = 0;
+namespace {
+constexpr uint32_t kHours = 72;
+constexpr uint32_t kMaxEndpoints = 1842;
+constexpr uint32_t kMaxGroups = kHours * kMaxEndpoints;
+constexpr uint32_t kHourBytes = 27;
 
-#if defined(_WIN32)
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    HANDLE hMapping = NULL;
-
-    bool open(const std::string& path) {
-        hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER fs;
-        if (!GetFileSizeEx(hFile, &fs)) { CloseHandle(hFile); return false; }
-        size = static_cast<size_t>(fs.QuadPart);
-        if (size == 0) return true;
-        hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (!hMapping) { CloseHandle(hFile); return false; }
-        data = static_cast<const char*>(MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0));
-        return data != nullptr;
+struct TransparentHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
     }
-
-    void close() {
-        if (data) { UnmapViewOfFile(data); data = nullptr; }
-        if (hMapping) { CloseHandle(hMapping); hMapping = NULL; }
-        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+    size_t operator()(const std::string& s) const noexcept {
+        return (*this)(std::string_view{s});
     }
-#else
-    int fd = -1;
-
-    bool open(const std::string& path) {
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st;
-        if (fstat(fd, &st) < 0) { ::close(fd); return false; }
-        size = static_cast<size_t>(st.st_size);
-        if (size == 0) return true;
-        void* ptr = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-        if (ptr == MAP_FAILED) { ::close(fd); return false; }
-        data = static_cast<const char*>(ptr);
-        return true;
+};
+struct TransparentEqual {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const noexcept {
+        return a == b;
     }
+};
+using EndpointMap = std::unordered_map<std::string, uint16_t, TransparentHash, TransparentEqual>;
 
-    void close() {
-        if (data && size > 0) { munmap(const_cast<char*>(data), size); data = nullptr; }
-        if (fd >= 0) { ::close(fd); fd = -1; }
-    }
-#endif
+struct GroupMeta {
+    uint32_t count = 0;
+    uint32_t errors = 0;
+    uint32_t cursor = 0;
+};
+static_assert(sizeof(GroupMeta) == 12);
 
-    ~MappedFile() { close(); }
+struct ParsedCountRecord {
+    int hour = -1;
+    std::string_view endpoint;
+    bool is_5xx = false;
+};
+struct ParsedLatencyRecord {
+    int hour = -1;
+    std::string_view endpoint;
+    uint32_t latency = 0;
 };
 
-static inline int parse_hour_id(const char* ts) {
-    int month = (ts[5] - '0') * 10 + (ts[6] - '0');
-    int day = (ts[8] - '0') * 10 + (ts[9] - '0');
-    int hour = (ts[11] - '0') * 10 + (ts[12] - '0');
+inline int parse_hour_id(const char* ts) noexcept {
+    const int month = (ts[5] - '0') * 10 + (ts[6] - '0');
+    const int day = (ts[8] - '0') * 10 + (ts[9] - '0');
+    const int hour = (ts[11] - '0') * 10 + (ts[12] - '0');
     if (month == 10) {
-        if (day == 30) return hour - 18;          // Oct 30, 18-23 -> 0..5
-        if (day == 31) return 6 + hour;           // Oct 31, 00-23 -> 6..29
+        if (day == 30 && hour >= 18) return hour - 18;
+        if (day == 31) return 6 + hour;
     } else if (month == 11) {
-        if (day == 1) return 30 + hour;           // Nov 01, 00-23 -> 30..53
-        if (day == 2) return 54 + hour;           // Nov 02, 00-17 -> 54..71
+        if (day == 1) return 30 + hour;
+        if (day == 2 && hour <= 17) return 54 + hour;
     }
     return -1;
 }
 
-static std::string make_hour_string(int hour_id) {
-    if (hour_id < 0 || hour_id >= 72) return "";
-    int month, day, hour;
-    if (hour_id < 6) {
-        month = 10; day = 30; hour = 18 + hour_id;
-    } else if (hour_id < 30) {
-        month = 10; day = 31; hour = hour_id - 6;
-    } else if (hour_id < 54) {
-        month = 11; day = 1; hour = hour_id - 30;
-    } else {
-        month = 11; day = 2; hour = hour_id - 54;
-    }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "2026-%02d-%02dT%02d:00:00Z", month, day, hour);
-    return std::string(buf);
+inline bool parse_common_fields(const char* first, const char* last,
+                                int& hour, std::string_view& endpoint,
+                                const char*& after_endpoint) noexcept {
+    if (last > first && last[-1] == '\r') --last;
+    if (static_cast<size_t>(last - first) < kHourBytes + 1 + 3 + 1 + 1) return false;
+    hour = parse_hour_id(first);
+    if (hour < 0 || hour >= static_cast<int>(kHours)) return false;
+
+    const char* p = first + kHourBytes;
+    if (p == last || *p++ != ' ') return false;
+    while (p < last && *p != ' ') ++p; // method
+    if (p == last) return false;
+    ++p;
+
+    const char* ep = p;
+    while (p < last && *p != ' ') ++p;
+    if (p == ep || p == last) return false;
+    endpoint = std::string_view(ep, static_cast<size_t>(p - ep));
+    after_endpoint = p + 1;
+    return true;
 }
 
-static inline void compute_percentiles(std::vector<uint32_t>& v, uint32_t& p50, uint32_t& p95, uint32_t& p99) {
-    size_t n = v.size();
-    if (n == 1) {
-        p50 = p95 = p99 = v[0];
-        return;
-    }
-    if (n == 2) {
-        if (v[0] > v[1]) {
-            std::swap(v[0], v[1]);
-        }
-        p50 = v[0];
-        p95 = p99 = v[1];
-        return;
-    }
-
-    size_t r50 = (50 * n + 99) / 100 - 1;
-    size_t r95 = (95 * n + 99) / 100 - 1;
-    size_t r99 = (99 * n + 99) / 100 - 1;
-
-    if (n <= 24) {
-        std::sort(v.begin(), v.end());
-        p50 = v[r50];
-        p95 = v[r95];
-        p99 = v[r99];
-        return;
-    }
-
-    std::nth_element(v.begin(), v.begin() + r95, v.end());
-    p95 = v[r95];
-
-    if (r50 == r95) {
-        p50 = p95;
-    } else {
-        std::nth_element(v.begin(), v.begin() + r50, v.begin() + r95);
-        p50 = v[r50];
-    }
-
-    if (r99 == r95) {
-        p99 = p95;
-    } else {
-        std::nth_element(v.begin() + r95 + 1, v.begin() + r99, v.end());
-        p99 = v[r99];
-    }
+inline bool parse_count_record(const char* first, const char* last,
+                               ParsedCountRecord& out) noexcept {
+    const char* p = nullptr;
+    if (!parse_common_fields(first, last, out.hour, out.endpoint, p)) return false;
+    if (last - p < 3) return false;
+    out.is_5xx = (*p == '5');
+    return p + 3 < last && p[3] == ' ';
 }
 
-static inline void append_uint(std::string& out, uint64_t v) {
-    char buf[32];
+inline bool parse_latency_record(const char* first, const char* last,
+                                 ParsedLatencyRecord& out) noexcept {
+    const char* p = nullptr;
+    if (!parse_common_fields(first, last, out.hour, out.endpoint, p)) return false;
+    if (last - p < 4 || p[3] != ' ') return false;
+    p += 4;
+    if (p == last) return false;
+    uint64_t value = 0;
+    for (; p < last; ++p) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (c < '0' || c > '9') return false;
+        value = value * 10 + (c - '0');
+        if (value > UINT32_MAX) return false;
+    }
+    out.latency = static_cast<uint32_t>(value);
+    return true;
+}
+
+inline uint16_t find_or_add_endpoint(EndpointMap& map, std::string_view endpoint) {
+    auto it = map.find(endpoint);
+    if (it != map.end()) return it->second;
+    if (map.size() >= kMaxEndpoints) throw std::runtime_error("endpoint catalogue exceeds the Track A limit");
+    const auto id = static_cast<uint16_t>(map.size());
+    auto inserted = map.emplace(std::string(endpoint), id);
+    return inserted.first->second;
+}
+
+inline void append_uint(std::string& out, uint64_t value) {
+    char buf[24];
     char* p = buf + sizeof(buf);
-    if (v == 0) {
+    if (value == 0) {
         out.push_back('0');
         return;
     }
-    while (v > 0) {
-        *--p = static_cast<char>('0' + (v % 10));
-        v /= 10;
+    while (value) {
+        *--p = static_cast<char>('0' + value % 10);
+        value /= 10;
     }
-    out.append(p, buf + sizeof(buf) - p);
+    out.append(p, static_cast<size_t>(buf + sizeof(buf) - p));
 }
 
-static inline size_t get_peak_rss_bytes() {
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        return pmc.PeakWorkingSetSize;
+inline std::string make_hour_string(uint32_t hour_id) {
+    int month, day, hour;
+    if (hour_id < 6) {
+        month = 10; day = 30; hour = 18 + static_cast<int>(hour_id);
+    } else if (hour_id < 30) {
+        month = 10; day = 31; hour = static_cast<int>(hour_id) - 6;
+    } else if (hour_id < 54) {
+        month = 11; day = 1; hour = static_cast<int>(hour_id) - 30;
+    } else {
+        month = 11; day = 2; hour = static_cast<int>(hour_id) - 54;
     }
-    return 0;
-#else
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        return static_cast<size_t>(usage.ru_maxrss) * 1024;
-    }
-    return 0;
-#endif
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "2026-%02d-%02dT%02d:00:00Z", month, day, hour);
+    return std::string(buf);
 }
 
-struct LocalGroup {
-    uint32_t count = 0;
-    uint32_t errors = 0;
-    std::vector<uint32_t> latencies;
-};
+inline void percentiles(uint32_t* first, uint32_t* last,
+                        uint32_t& p50, uint32_t& p95, uint32_t& p99) {
+    const size_t n = static_cast<size_t>(last - first);
+    const size_t r50 = (50 * n + 99) / 100 - 1;
+    const size_t r95 = (95 * n + 99) / 100 - 1;
+    const size_t r99 = (99 * n + 99) / 100 - 1;
 
-struct WorkerThread {
-    std::unordered_map<std::string_view, uint16_t> ep_map;
-    std::vector<std::string_view> ep_names;
-    std::vector<std::vector<LocalGroup>> table; // table[72][local_ep_id]
-    size_t ep_capacity = 2048;
+    if (n <= 24) {
+        std::sort(first, last);
+        p50 = first[r50];
+        p95 = first[r95];
+        p99 = first[r99];
+        return;
+    }
 
-    WorkerThread() {
-        ep_names.reserve(2048);
-        ep_map.reserve(4096);
-        table.resize(72);
-        for (int h = 0; h < 72; ++h) {
-            table[h].resize(ep_capacity);
+    std::nth_element(first, first + r95, last);
+    p95 = first[r95];
+    if (r50 == r95) p50 = p95;
+    else {
+        std::nth_element(first, first + r50, first + r95);
+        p50 = first[r50];
+    }
+    if (r99 == r95) p99 = p95;
+    else {
+        std::nth_element(first + r95 + 1, first + r99, last);
+        p99 = first[r99];
+    }
+}
+
+template <class Record, class Parser, class Fn>
+bool scan_file(const std::string& path, Parser parser, Fn&& fn, std::string& error) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error = std::string("cannot open input: ") + std::strerror(errno);
+        return false;
+    }
+
+    constexpr size_t kChunkBytes = 64u * 1024u;
+    constexpr size_t kMaxLineBytes = 256u;
+    std::array<char, kChunkBytes + kMaxLineBytes> buffer{};
+    size_t carry = 0;
+    Record record;
+
+    for (;;) {
+        ssize_t got;
+        do {
+            got = ::read(fd, buffer.data() + carry, kChunkBytes);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            error = std::string("input read failed: ") + std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
+
+        char* p = buffer.data();
+        char* const end = p + carry + static_cast<size_t>(got);
+        while (p < end) {
+            const char* nl = static_cast<const char*>(
+                std::memchr(p, '\n', static_cast<size_t>(end - p)));
+            if (!nl) break;
+            if (!parser(p, nl, record)) {
+                error = "malformed Track A record";
+                ::close(fd);
+                return false;
+            }
+            if (!fn(record)) {
+                ::close(fd);
+                return false;
+            }
+            p = const_cast<char*>(nl) + 1;
+        }
+
+        carry = static_cast<size_t>(end - p);
+        if (carry >= kMaxLineBytes) {
+            error = "record exceeds the Track A maximum line length";
+            ::close(fd);
+            return false;
+        }
+        if (carry) std::memmove(buffer.data(), p, carry);
+
+        if (got == 0) {
+            ::close(fd);
+            if (carry != 0) {
+                error = "input does not end with LF";
+                return false;
+            }
+            return true;
         }
     }
-};
+}
 
-int main(int argc, char* argv[]) {
-    auto t_start = std::chrono::steady_clock::now();
-    std::ios_base::sync_with_stdio(false);
+size_t peak_rss_bytes() noexcept {
+    struct rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+    return static_cast<size_t>(usage.ru_maxrss) * 1024u;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    std::ios::sync_with_stdio(false);
     std::string data_dir = "/data";
     std::string out_dir = "/out";
     bool profile = false;
-
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc) {
-            data_dir = argv[++i];
-        } else if (arg == "--out" && i + 1 < argc) {
-            out_dir = argv[++i];
-        } else if (arg == "--profile") {
-            profile = true;
-        }
+        const std::string_view arg(argv[i]);
+        if (arg == "--data" && i + 1 < argc) data_dir = argv[++i];
+        else if (arg == "--out" && i + 1 < argc) out_dir = argv[++i];
+        else if (arg == "--profile") profile = true;
     }
-
-    std::string input_path = data_dir + "/requests.log";
-    std::string output_path = out_dir + "/summary.txt";
 
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
-
-    MappedFile mf;
-    if (!mf.open(input_path)) {
-        std::string alt_input = data_dir + "\\requests.log";
-        if (!mf.open(alt_input)) {
-            std::cerr << "FAIL cannot open " << input_path << "\n";
-            return 1;
-        }
+    if (ec) {
+        std::cerr << "FAIL cannot create output directory: " << ec.message() << '\n';
+        return 1;
     }
 
-    if (mf.size == 0) {
-        std::ofstream empty_out(output_path, std::ios::binary);
+    const std::string input_path = data_dir + "/requests.log";
+
+    EndpointMap endpoint_ids;
+    endpoint_ids.max_load_factor(0.8f);
+    endpoint_ids.reserve(kMaxEndpoints);
+    std::vector<GroupMeta> groups(kMaxGroups);
+    uint64_t total_records = 0;
+    std::string error;
+
+    // Pass 1: count records and 5xx responses per (hour, endpoint).
+    // The fixed group table is only 72 x 1,842 x 12 bytes; no per-worker
+    // vectors or per-group heap allocations are created.
+    const bool first_ok = scan_file<ParsedCountRecord>(input_path, parse_count_record, [&](const ParsedCountRecord& record) {
+        const uint16_t endpoint_id = find_or_add_endpoint(endpoint_ids, record.endpoint);
+        GroupMeta& group = groups[static_cast<size_t>(record.hour) * kMaxEndpoints + endpoint_id];
+        if (group.count == UINT32_MAX) {
+            error = "group count exceeds uint32 range";
+            return false;
+        }
+        ++group.count;
+        if (record.is_5xx) ++group.errors;
+        ++total_records;
+        return true;
+    }, error);
+    if (!first_ok) {
+        std::cerr << "FAIL first pass: " << error << '\n';
+        return 1;
+    }
+
+    if (total_records == 0) {
+        std::ofstream empty_out(out_dir + "/summary.txt", std::ios::binary);
+        if (!empty_out) {
+            std::cerr << "FAIL cannot write summary.txt\n";
+            return 1;
+        }
         return 0;
     }
-
-    // Number of worker threads
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
-
-    // Small files (< 2MB) don't need multiple threads
-    if (mf.size < 2 * 1024 * 1024) {
-        num_threads = 1;
+    if (total_records > UINT32_MAX) {
+        std::cerr << "FAIL total record count exceeds uint32 range\n";
+        return 1;
     }
 
-    std::vector<WorkerThread> workers(num_threads);
-
-    // Compute byte chunks aligned to newlines
-    struct Chunk {
-        const char* start = nullptr;
-        const char* end = nullptr;
-    };
-    std::vector<Chunk> chunks(num_threads);
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        size_t nom_start = (mf.size * t) / num_threads;
-        size_t nom_end = (mf.size * (t + 1)) / num_threads;
-
-        const char* start = mf.data + nom_start;
-        const char* end = mf.data + nom_end;
-
-        if (t > 0) {
-            while (start < mf.data + mf.size && *start != '\n') ++start;
-            if (start < mf.data + mf.size && *start == '\n') ++start;
-        }
-        if (t < num_threads - 1) {
-            while (end < mf.data + mf.size && *end != '\n') ++end;
-            if (end < mf.data + mf.size && *end == '\n') ++end;
-        } else {
-            end = mf.data + mf.size;
-        }
-
-        chunks[t] = {start, end};
-    }
-
-    // Launch worker threads in parallel
-    std::vector<std::thread> thread_pool;
-    thread_pool.reserve(num_threads);
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        thread_pool.emplace_back([t, &workers, &chunks]() {
-            auto& w = workers[t];
-            const char* ptr = chunks[t].start;
-            const char* end = chunks[t].end;
-
-            while (ptr < end) {
-                if (ptr + 27 >= end) break;
-
-                int hour_id = parse_hour_id(ptr);
-                const char* p = ptr + 27;
-                if (p < end && *p == ' ') ++p;
-
-                // Skip method
-                while (p < end && *p != ' ') ++p;
-                if (p < end && *p == ' ') ++p;
-
-                // Endpoint
-                const char* ep_start = p;
-                while (p < end && *p != ' ') ++p;
-                std::string_view ep(ep_start, p - ep_start);
-                if (p < end && *p == ' ') ++p;
-
-                // Status (3 digits)
-                bool is_5xx = (p < end && *p == '5');
-                p += 3;
-                if (p < end && *p == ' ') ++p;
-
-                // Latency
-                uint32_t latency = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    latency = latency * 10 + (*p - '0');
-                    ++p;
-                }
-
-                if (p < end && *p == '\r') ++p;
-                if (p < end && *p == '\n') ++p;
-                ptr = p;
-
-                uint16_t local_id;
-                auto it = w.ep_map.find(ep);
-                if (it != w.ep_map.end()) {
-                    local_id = it->second;
-                } else {
-                    local_id = static_cast<uint16_t>(w.ep_names.size());
-                    w.ep_names.emplace_back(ep);
-                    w.ep_map.emplace(ep, local_id);
-                    if (local_id >= w.ep_capacity) {
-                        w.ep_capacity *= 2;
-                        for (int h = 0; h < 72; ++h) {
-                            w.table[h].resize(w.ep_capacity);
-                        }
-                    }
-                }
-
-                if (hour_id >= 0 && hour_id < 72) {
-                    auto& grp = w.table[hour_id][local_id];
-                    grp.count++;
-                    if (is_5xx) grp.errors++;
-                    grp.latencies.push_back(latency);
-                }
-            }
-        });
-    }
-
-    for (auto& th : thread_pool) {
-        th.join();
-    }
-    thread_pool.clear();
-
-    // Merge endpoint names into unified catalogue
-    std::vector<std::string_view> global_ep_names;
-    global_ep_names.reserve(2048);
-    std::unordered_map<std::string_view, uint16_t> global_ep_map;
-    global_ep_map.reserve(4096);
-
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        for (const auto& ep : workers[t].ep_names) {
-            if (global_ep_map.find(ep) == global_ep_map.end()) {
-                uint16_t gid = static_cast<uint16_t>(global_ep_names.size());
-                global_ep_names.push_back(ep);
-                global_ep_map.emplace(ep, gid);
-            }
-        }
-    }
-
-    size_t num_global_eps = global_ep_names.size();
-
-    // Map each worker's local_id -> global_id
-    std::vector<std::vector<uint16_t>> local_to_global(num_threads);
-    for (unsigned int t = 0; t < num_threads; ++t) {
-        local_to_global[t].resize(workers[t].ep_names.size());
-        for (size_t i = 0; i < workers[t].ep_names.size(); ++i) {
-            local_to_global[t][i] = global_ep_map[workers[t].ep_names[i]];
-        }
-    }
-
-    // Sort global endpoint IDs in ascending unsigned bytewise order
-    std::vector<uint16_t> sorted_global_eps(num_global_eps);
-    std::iota(sorted_global_eps.begin(), sorted_global_eps.end(), 0);
-    std::sort(sorted_global_eps.begin(), sorted_global_eps.end(), [&](uint16_t a, uint16_t b) {
-        return global_ep_names[a] < global_ep_names[b];
-    });
-
-    // Invert sorted order: for each global_id -> index in sorted list
-    // To allow workers' data to be merged directly by global_id
-    // Prepare 72 hour strings
-    std::vector<std::string> hour_strings(72);
-    for (int h = 0; h < 72; ++h) {
-        hour_strings[h] = make_hour_string(h);
-    }
-
-    // Parallel reduction and formatting across 72 hours
-    std::vector<std::string> hour_outputs(72);
-
-    auto process_hour_range = [&](int h_start, int h_end) {
-        for (int h = h_start; h < h_end; ++h) {
-            const std::string& hour_str = hour_strings[h];
-            std::string& out = hour_outputs[h];
-            out.reserve(256 * 1024);
-
-            // Reconstruct aggregated groups for this hour
-            // Map global_id -> merged info
-            struct AggGroup {
-                uint32_t total_count = 0;
-                uint32_t total_errors = 0;
-            };
-            std::vector<AggGroup> agg(num_global_eps);
-
-            for (unsigned int t = 0; t < num_threads; ++t) {
-                const auto& w_tbl = workers[t].table[h];
-                const auto& remap = local_to_global[t];
-                for (size_t l_id = 0; l_id < remap.size(); ++l_id) {
-                    uint16_t g_id = remap[l_id];
-                    agg[g_id].total_count += w_tbl[l_id].count;
-                    agg[g_id].total_errors += w_tbl[l_id].errors;
-                }
-            }
-
-            for (size_t i = 0; i < num_global_eps; ++i) {
-                uint16_t g_id = sorted_global_eps[i];
-                uint32_t n = agg[g_id].total_count;
-                if (n == 0) continue;
-
-                // Merge latencies
-                std::vector<uint32_t> latencies;
-                latencies.reserve(n);
-                for (unsigned int t = 0; t < num_threads; ++t) {
-                    const auto& remap = local_to_global[t];
-                    // Find if worker had this endpoint
-                    const auto& w = workers[t];
-                    auto it = w.ep_map.find(global_ep_names[g_id]);
-                    if (it != w.ep_map.end()) {
-                        uint16_t l_id = it->second;
-                        const auto& src = w.table[h][l_id].latencies;
-                        latencies.insert(latencies.end(), src.begin(), src.end());
-                    }
-                }
-
-                uint32_t p50, p95, p99;
-                compute_percentiles(latencies, p50, p95, p99);
-
-                uint32_t errors = agg[g_id].total_errors;
-                uint32_t ppm = static_cast<uint32_t>((static_cast<uint64_t>(errors) * 1000000ULL) / n);
-
-                out.append(hour_str);
-                out.push_back(' ');
-                out.append(global_ep_names[g_id]);
-                out.push_back(' ');
-                append_uint(out, n);
-                out.push_back(' ');
-                append_uint(out, p50);
-                out.push_back(' ');
-                append_uint(out, p95);
-                out.push_back(' ');
-                append_uint(out, p99);
-                out.push_back(' ');
-                append_uint(out, errors);
-                out.push_back(' ');
-                append_uint(out, ppm);
-                out.push_back('\n');
-            }
-        }
-    };
-
-    // Partition 72 hours across threads for reduction
-    unsigned int red_threads = std::min(num_threads, 8u);
-    for (unsigned int t = 0; t < red_threads; ++t) {
-        int h_start = (72 * t) / red_threads;
-        int h_end = (72 * (t + 1)) / red_threads;
-        thread_pool.emplace_back(process_hour_range, h_start, h_end);
-    }
-
-    for (auto& th : thread_pool) {
-        th.join();
-    }
-
-    // Assemble final output buffer in order 0..71
-    std::string out_buf;
-    out_buf.reserve(12 * 1024 * 1024);
-    for (int h = 0; h < 72; ++h) {
-        out_buf.append(hour_outputs[h]);
-    }
-
-    // Write output file
-    std::ofstream out_file(output_path, std::ios::binary);
-    if (!out_file.is_open()) {
-        std::string alt_output = out_dir + "\\summary.txt";
-        out_file.open(alt_output, std::ios::binary);
-        if (!out_file.is_open()) {
-            std::cerr << "FAIL cannot write to " << output_path << "\n";
+    // Turn the per-group counts into prefix cursors. Each group's cursor advances
+    // during pass 2, then cursor-count gives its exact beginning in the flat array.
+    uint32_t running_offset = 0;
+    for (GroupMeta& group : groups) {
+        group.cursor = running_offset;
+        if (UINT32_MAX - running_offset < group.count) {
+            std::cerr << "FAIL latency offsets exceed uint32 range\n";
             return 1;
         }
+        running_offset += group.count;
     }
-    out_file.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
-    out_file.close();
+    if (running_offset != total_records) {
+        std::cerr << "FAIL internal count/prefix mismatch\n";
+        return 1;
+    }
+
+    // Exactly one uint32 per request; unlike vector-per-group storage, this has no
+    // capacity slack, per-vector allocator metadata, or duplicated worker-local tables.
+    std::unique_ptr<uint32_t[]> latencies(new (std::nothrow) uint32_t[static_cast<size_t>(total_records)]);
+    if (!latencies) {
+        std::cerr << "FAIL cannot allocate latency array\n";
+        return 1;
+    }
+
+    // Pass 2: place each latency directly into its group's contiguous slice.
+    // The cursor array was prepared by prefix-summing counts in pass 1.
+    const bool second_ok = scan_file<ParsedLatencyRecord>(input_path, parse_latency_record, [&](const ParsedLatencyRecord& record) {
+        const auto it = endpoint_ids.find(record.endpoint);
+        if (it == endpoint_ids.end()) {
+            error = "endpoint catalogue changed between input passes";
+            return false;
+        }
+        GroupMeta& group = groups[static_cast<size_t>(record.hour) * kMaxEndpoints + it->second];
+        if (group.cursor >= total_records) {
+            error = "latency write cursor exceeds allocated array";
+            return false;
+        }
+        latencies[group.cursor++] = record.latency;
+        return true;
+    }, error);
+    if (!second_ok) {
+        std::cerr << "FAIL second pass: " << error << '\n';
+        return 1;
+    }
+
+    // Build a compact endpoint-name table. unordered_map element references remain
+    // stable after rehash; no endpoint strings are copied into a second catalogue.
+    const size_t endpoint_count = endpoint_ids.size();
+    std::vector<std::string_view> endpoint_names(endpoint_count);
+    for (const auto& entry : endpoint_ids) endpoint_names[entry.second] = entry.first;
+    std::vector<uint16_t> sorted_endpoint_ids(endpoint_count);
+    std::iota(sorted_endpoint_ids.begin(), sorted_endpoint_ids.end(), uint16_t{0});
+    std::sort(sorted_endpoint_ids.begin(), sorted_endpoint_ids.end(),
+              [&](uint16_t a, uint16_t b) { return endpoint_names[a] < endpoint_names[b]; });
+
+    std::array<std::string, kHours> hour_names;
+    for (uint32_t h = 0; h < kHours; ++h) hour_names[h] = make_hour_string(h);
+
+    // Stream output one line at a time; do not retain the 10 MB result in RAM.
+    std::vector<char> output_buffer(8u * 1024u);
+    std::ofstream output;
+    output.rdbuf()->pubsetbuf(output_buffer.data(), static_cast<std::streamsize>(output_buffer.size()));
+    output.open(out_dir + "/summary.txt", std::ios::binary);
+    if (!output) {
+        std::cerr << "FAIL cannot open summary.txt for writing\n";
+        return 1;
+    }
+    std::string line;
+    line.reserve(256);
+
+    for (uint32_t h = 0; h < kHours; ++h) {
+        for (const uint16_t endpoint_id : sorted_endpoint_ids) {
+            GroupMeta& group = groups[static_cast<size_t>(h) * kMaxEndpoints + endpoint_id];
+            const uint32_t n = group.count;
+            if (n == 0) continue;
+
+            const uint32_t end_offset = group.cursor;
+            if (end_offset < n) {
+                std::cerr << "FAIL invalid group latency range\n";
+                return 1;
+            }
+            uint32_t* first = latencies.get() + (end_offset - n);
+            uint32_t* last = first + n;
+            uint32_t p50, p95, p99;
+            percentiles(first, last, p50, p95, p99);
+
+            const uint64_t error_ppm = (static_cast<uint64_t>(group.errors) * 1000000ULL) / n;
+            line.clear();
+            line.append(hour_names[h]);
+            line.push_back(' ');
+            line.append(endpoint_names[endpoint_id]);
+            line.push_back(' ');
+            append_uint(line, n);
+            line.push_back(' ');
+            append_uint(line, p50);
+            line.push_back(' ');
+            append_uint(line, p95);
+            line.push_back(' ');
+            append_uint(line, p99);
+            line.push_back(' ');
+            append_uint(line, group.errors);
+            line.push_back(' ');
+            append_uint(line, error_ppm);
+            line.push_back('\n');
+            output.write(line.data(), static_cast<std::streamsize>(line.size()));
+        }
+    }
+    output.close();
+    if (!output) {
+        std::cerr << "FAIL writing summary.txt\n";
+        return 1;
+    }
 
     if (profile) {
-        auto t_end = std::chrono::steady_clock::now();
-        double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        size_t peak_rss = get_peak_rss_bytes();
-        std::cerr << "wall_time: " << (elapsed_ms / 1000.0) << " s\n";
-        std::cerr << "peak_rss: " << (peak_rss / (1024.0 * 1024.0)) << " MB\n";
+        std::cerr << "records: " << total_records << '\n'
+                  << "endpoints: " << endpoint_count << '\n'
+                  << "peak_rss_mb: " << (peak_rss_bytes() / (1024.0 * 1024.0)) << '\n';
     }
-
     return 0;
 }
