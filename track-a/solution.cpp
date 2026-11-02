@@ -269,13 +269,17 @@ int main(int argc, char* argv[]) {
         const char* start = mf.data + nom_start;
         const char* end = mf.data + nom_end;
 
-        if (t > 0) {
+        // If a boundary is already at the start of a record, keep it.
+        // Otherwise discard only the partial record that crosses the boundary.
+        if (t > 0 && start > mf.data && start[-1] != '\n') {
             while (start < mf.data + mf.size && *start != '\n') ++start;
             if (start < mf.data + mf.size && *start == '\n') ++start;
         }
         if (t < num_threads - 1) {
-            while (end < mf.data + mf.size && *end != '\n') ++end;
-            if (end < mf.data + mf.size && *end == '\n') ++end;
+            if (end > mf.data && end[-1] != '\n') {
+                while (end < mf.data + mf.size && *end != '\n') ++end;
+                if (end < mf.data + mf.size && *end == '\n') ++end;
+            }
         } else {
             end = mf.data + mf.size;
         }
