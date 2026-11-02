@@ -1,14 +1,16 @@
 # Track A performance log
 
-This log distinguishes team-reported local experiments from measurements produced by the Speed Demon live board. **No official board run ID is available yet**: the board feed reported that the Speed Demon Board App was not installed on this repository. Do not treat local timings as official scoring measurements.
+This log records the optimisation journey for LightSpeed's Track A submission. It separates team-reported local experiments from measurements produced by the official Speed Demon board.
+
+The team reports that LightSpeed and points are now visible on the live website. That confirms the team is appearing on the board, but this file still needs the **actual Track A run ID and run details** to make its official-measurement section complete. Do not infer runtime, memory, gates, or a run ID from the displayed points alone.
 
 ## Scoring reference
 
-The published Track A reference anchor is **32.05 s** and **228 MB** on the scoring machine. The board, not a local machine, determines the official run time, memory, source-size and dependency measurements.
+The published Track A reference anchor is **32.05 s** and **228 MB** on the scoring machine. The board determines official runtime, memory, source-size and dependency measurements. The live-board result is a practice measurement; final scoring uses the recorded commit and the hidden holdout dataset.
 
 ## Local experiment history
 
-The following values are taken from the team's previously supplied local benchmark/integration reports. They are retained as engineering history only; the hardware and measurement method are not the official scoring measurement.
+The following values are from the team's previously supplied local benchmark/integration reports. They are engineering history only; the hardware and measurement method are not the official scoring measurement.
 
 | Candidate | Change / result | Local measurement | Decision | Official board run ID |
 |---|---|---:|---|---|
@@ -35,14 +37,16 @@ These are previously reported local results, not a fresh run in this audit and n
 
 ## Official board measurements
 
+Fill this row from the actual Track A result shown on the live board. Use the exact run ID and commit SHA; copy the measured fields from that result. If the board only shows the team and points, open the team's Track A run/result details first.
+
 | Candidate / commit | Board run ID | T (s) | M (MB) | S (source lines) | D | K | Points | Gates |
 |---|---|---:|---:|---:|---:|---:|---:|---|
-| Final Track A candidate | Pending Board App installation and successful board run | — | — | — | — | — | — | — |
+| Final Track A candidate | Awaiting exact Track A run details | — | — | — | — | — | — | — |
 
-After the live board detects the repository, replace the pending row with the actual run ID, commit SHA and measured values. Add subsequent optimisation steps only when the corresponding board run exists. Never substitute local timings or invented run IDs for board evidence.
+Do not substitute local timings or invent run IDs. Add later optimisation steps only when a corresponding board run exists, and connect each claimed improvement to the run that measured it.
 
 ## Next measurement-led work
 
-1. Install the Speed Demon Board App on this repository and confirm the board watcher detects the `speed-demon` branch.
-2. Obtain a successful Track A board run and record its actual run ID and metrics above.
-3. Consider further changes only when profiling identifies a bottleneck; verify every candidate against the exact output hash and the official sandbox before retaining it.
+1. Open LightSpeed's Track A result on the live board and capture its run ID, commit SHA, measured metrics and gate status.
+2. Replace the pending row above with those exact values.
+3. Make further code changes only if there is enough time and a measured bottleneck to justify them; verify each candidate against the exact output hash and sandbox before retaining it.
