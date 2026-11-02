@@ -7,19 +7,19 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <fcntl.h>
+#include <nmmintrin.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 namespace {
-constexpr uint32_t kHours = 72;
-constexpr uint32_t kMaxEndpoints = 1842;
+constexpr uint32_t kHours = 72, kMaxEndpoints = 1842, kHourBytes = 27;
 constexpr uint32_t kMaxGroups = kHours * kMaxEndpoints;
-constexpr uint32_t kHourBytes = 27;
 constexpr size_t kEndpointTableSize = 4096;
 
 struct EndpointSlot {
@@ -44,14 +44,36 @@ struct Record {
     bool is_5xx = false;
 };
 
+__attribute__((target("sse4.2"))) inline uint64_t compute_crc32c(const char* s, size_t len) noexcept {
+    uint64_t crc = 0xFFFFFFFF, v;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        std::memcpy(&v, s + i, 8);
+        crc = _mm_crc32_u64(crc, v);
+    }
+    for (; i < len; ++i) crc = _mm_crc32_u8(static_cast<uint32_t>(crc), static_cast<unsigned char>(s[i]));
+    return crc ? crc : 1;
+}
+
+inline bool inline_streq(const char* a, const char* b, size_t len) noexcept {
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t va, vb;
+        std::memcpy(&va, a + i, 8);
+        std::memcpy(&vb, b + i, 8);
+        if (va != vb) return false;
+    }
+    for (; i < len; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
 inline int parse_hour_id(const char* ts) noexcept {
     static constexpr int kDayBase[8] = {-18, 6, -999, -999, -999, 30, 54, -999};
-    const size_t day_key = ((static_cast<size_t>(ts[6]) & 1u) << 2u) | (static_cast<size_t>(ts[9]) & 3u);
-    const int base = kDayBase[day_key];
-    const int hour = static_cast<int>(static_cast<unsigned char>(ts[11])) * 10 + static_cast<int>(static_cast<unsigned char>(ts[12])) - 528;
-    const int hour_id = base + hour;
-    if (hour_id >= 0 && hour_id < static_cast<int>(kHours)) return hour_id;
-    return -1;
+    const size_t key = ((static_cast<size_t>(ts[6]) & 1u) << 2u) | (static_cast<size_t>(ts[9]) & 3u);
+    const int h = kDayBase[key] + (ts[11] - '0') * 10 + (ts[12] - '0');
+    return (h >= 0 && h < static_cast<int>(kHours)) ? h : -1;
 }
 
 template <bool ParseLatency>
@@ -67,13 +89,12 @@ inline bool parse_line(const char* first, const char* last, Record& out) noexcep
     if (++p >= last) return false;
 
     const char* ep = p;
-    uint64_t h = 14695981039346656037ULL;
-    while (p < last && *p != ' ') {
-        h = (h ^ static_cast<unsigned char>(*p++)) * 1099511628211ULL;
-    }
-    if (p == ep || p == last) return false;
-    out.ep_hash = h ? h : 1;
-    out.endpoint = std::string_view(ep, static_cast<size_t>(p - ep));
+    const char* sp = static_cast<const char*>(std::memchr(p, ' ', static_cast<size_t>(last - p)));
+    if (!sp || sp == p) return false;
+    const size_t ep_len = static_cast<size_t>(sp - p);
+    out.ep_hash = compute_crc32c(ep, ep_len);
+    out.endpoint = std::string_view(ep, ep_len);
+    p = sp;
 
     if (++p >= last || last - p < 4 || p[3] != ' ') return false;
     if constexpr (!ParseLatency) {
@@ -99,7 +120,7 @@ inline size_t lookup_slot(const EndpointCatalogue& cat, std::string_view ep, uin
     size_t idx = hash & (kEndpointTableSize - 1);
     while (cat.table[idx].hash != 0) {
         if (cat.table[idx].hash == hash && cat.table[idx].len == len &&
-            std::memcmp(cat.arena.data() + cat.table[idx].str_offset, ep.data(), len) == 0) {
+            inline_streq(cat.arena.data() + cat.table[idx].str_offset, ep.data(), len)) {
             return idx;
         }
         idx = (idx + 1) & (kEndpointTableSize - 1);
@@ -136,10 +157,8 @@ struct OutputWriter {
 
     void flush() {
         for (size_t off = 0; off < pos;) {
-            ssize_t res;
-            do {
-                res = ::write(fd, buffer + off, pos - off);
-            } while (res < 0 && errno == EINTR);
+            ssize_t res = ::write(fd, buffer + off, pos - off);
+            if (res < 0 && errno == EINTR) continue;
             if (res <= 0) break;
             off += static_cast<size_t>(res);
         }
@@ -153,8 +172,7 @@ struct OutputWriter {
     }
 
     void put_u(uint32_t val, char sep = ' ') noexcept {
-        char temp[11];
-        char* p = temp + sizeof(temp);
+        char temp[11], *p = temp + sizeof(temp);
         do {
             *--p = static_cast<char>('0' + (val % 10));
             val /= 10;
@@ -181,32 +199,22 @@ inline void percentiles(uint32_t* first, uint32_t* last,
     const size_t n = static_cast<size_t>(last - first);
     if (n <= 3) {
         if (n > 1 && first[0] > first[1]) std::swap(first[0], first[1]);
-        if (n == 3) {
-            if (first[1] > first[2]) std::swap(first[1], first[2]);
-            if (first[0] > first[1]) std::swap(first[0], first[1]);
-        }
+        if (n == 3 && first[1] > first[2]) std::swap(first[1], first[2]);
+        if (n > 1 && first[0] > first[1]) std::swap(first[0], first[1]);
         p50 = (n == 2) ? first[0] : first[n / 2];
         p95 = p99 = first[n - 1];
         return;
     }
-
-    const size_t r50 = (50 * n + 99) / 100 - 1;
-    const size_t r95 = (95 * n + 99) / 100 - 1;
-    const size_t r99 = (99 * n + 99) / 100 - 1;
-
+    const size_t r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
     if (n <= 24) {
         std::sort(first, last);
-        p50 = first[r50];
-        p95 = first[r95];
-        p99 = first[r99];
-        return;
+    } else {
+        std::nth_element(first, first + r95, last);
+        if (r50 != r95) std::nth_element(first, first + r50, first + r95);
+        if (r99 != r95) std::nth_element(first + r95 + 1, first + r99, last);
     }
-
-    std::nth_element(first, first + r95, last);
-    p95 = first[r95];
-    if (r50 != r95) std::nth_element(first, first + r50, first + r95);
     p50 = first[r50];
-    if (r99 != r95) std::nth_element(first + r95 + 1, first + r99, last);
+    p95 = first[r95];
     p99 = first[r99];
 }
 
@@ -215,16 +223,14 @@ bool scan_file(const std::string& path, Fn&& fn) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
 
-    constexpr size_t kChunk = 64 * 1024;
+    constexpr size_t kChunk = 256 * 1024;
     std::array<char, kChunk + 256> buf;
     size_t carry = 0;
     Record rec;
 
     for (;;) {
-        ssize_t got;
-        do {
-            got = ::read(fd, buf.data() + carry, kChunk);
-        } while (got < 0 && errno == EINTR);
+        ssize_t got = ::read(fd, buf.data() + carry, kChunk);
+        if (got < 0 && errno == EINTR) continue;
         if (got < 0) break;
 
         char* p = buf.data();
@@ -254,8 +260,7 @@ bool scan_file(const std::string& path, Fn&& fn) {
 
 size_t peak_rss_bytes() noexcept {
     struct rusage usage{};
-    if (::getrusage(RUSAGE_SELF, &usage) != 0) return 0;
-    return static_cast<size_t>(usage.ru_maxrss) * 1024u;
+    return (::getrusage(RUSAGE_SELF, &usage) == 0) ? static_cast<size_t>(usage.ru_maxrss) * 1024u : 0;
 }
 } // namespace
 
@@ -265,8 +270,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "--data" && i + 1 < argc) data_dir = argv[++i];
-        else if (arg == "--out" && i + 1 < argc) out_dir = argv[++i];
-        else if (arg == "--profile") profile = true;
+        if (arg == "--out" && i + 1 < argc) out_dir = argv[++i];
+        if (arg == "--profile") profile = true;
     }
 
     std::error_code ec;
@@ -295,9 +300,8 @@ int main(int argc, char** argv) {
 
     const std::string out_file = out_dir + "/summary.txt";
     const int out_fd = ::open(out_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (out_fd < 0) return 1;
+    if (out_fd < 0 || total_records > UINT32_MAX) return 1;
     if (total_records == 0) { ::close(out_fd); return 0; }
-    if (total_records > UINT32_MAX) { ::close(out_fd); return 1; }
 
     uint32_t running_offset = 0;
     for (size_t i = 0; i < kMaxGroups; ++i) {
@@ -323,15 +327,15 @@ int main(int argc, char** argv) {
         if (s.hash) ep_names[s.id] = std::string_view(catalogue.arena.data() + s.str_offset, s.len);
     }
     std::vector<uint16_t> sorted_ep(ep_cnt);
-    for (uint16_t i = 0; i < ep_cnt; ++i) sorted_ep[i] = i;
+    std::iota(sorted_ep.begin(), sorted_ep.end(), 0);
     std::sort(sorted_ep.begin(), sorted_ep.end(), [&](uint16_t a, uint16_t b) {
         return ep_names[a] < ep_names[b];
     });
 
-    static constexpr struct { int m, d, h; } kDays[] = {{10, 30, 18}, {10, 31, -6}, {11, 1, -30}, {11, 2, -54}};
     char hour_names[kHours][21];
     for (int h = 0; h < 72; ++h) {
-        const auto& [m, d, base] = kDays[(h < 6) ? 0 : (h < 30) ? 1 : (h < 54) ? 2 : 3];
+        const int m = (h < 30) ? 10 : 11, d = (h < 6) ? 30 : (h < 30) ? 31 : (h < 54) ? 1 : 2;
+        const int base = (h < 6) ? 18 : (h < 30) ? -6 : (h < 54) ? -30 : -54;
         std::snprintf(hour_names[h], 21, "2026-%02d-%02dT%02d:00:00Z", m, d, h + base);
     }
 
@@ -344,12 +348,10 @@ int main(int argc, char** argv) {
             const uint32_t n = group_counts[g];
             if (n == 0) continue;
 
-            uint32_t* first = latencies.get() + (group_cursors[g] - n);
-            uint32_t p50, p95, p99;
+            uint32_t* first = latencies.get() + (group_cursors[g] - n), p50, p95, p99;
             percentiles(first, first + n, p50, p95, p99);
-
-            const uint32_t ppm = static_cast<uint32_t>((static_cast<uint64_t>(group_errors[g]) * 1000000ULL) / n);
-            writer.write_line(hr_sv, ep_names[ep_id], n, p50, p95, p99, group_errors[g], ppm);
+            writer.write_line(hr_sv, ep_names[ep_id], n, p50, p95, p99, group_errors[g],
+                              static_cast<uint32_t>((static_cast<uint64_t>(group_errors[g]) * 1000000ULL) / n));
         }
     }
     writer.flush();
